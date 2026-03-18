@@ -107,6 +107,7 @@ jobs:
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
             -var="project_name=ecommerce" \
             -var="environment=prod" \
+            -var="operator_ip_cidr=${{ secrets.OPERATOR_IP_CIDR }}" \
             -out=tfplan -detailed-exitcode
         continue-on-error: true
       - name: Upload plan artifact
@@ -126,14 +127,15 @@ jobs:
     if: github.ref == 'refs/heads/main' && (github.event.inputs.action == 'apply' || github.event_name == 'push')
     environment: production
     outputs:
-      eks_cluster_name: ${{ steps.tf_out.outputs.eks_cluster_name }}
-      rabbitmq_ip:      ${{ steps.tf_out.outputs.rabbitmq_ip }}
-      aurora_endpoint:  ${{ steps.tf_out.outputs.aurora_endpoint }}
-      alb_dns_name:     ${{ steps.tf_out.outputs.alb_dns_name }}
-      ecr_backend_url:  ${{ steps.tf_out.outputs.ecr_backend_url }}
-      ecr_worker_url:   ${{ steps.tf_out.outputs.ecr_worker_url }}
-      aws_account_id:   ${{ steps.tf_out.outputs.aws_account_id }}
-      vpc_id:           ${{ steps.tf_out.outputs.vpc_id }}
+      eks_cluster_name:   ${{ steps.tf_out.outputs.eks_cluster_name }}
+      rabbitmq_ip:        ${{ steps.tf_out.outputs.rabbitmq_ip }}
+      rabbitmq_public_ip: ${{ steps.tf_out.outputs.rabbitmq_public_ip }}
+      aurora_endpoint:    ${{ steps.tf_out.outputs.aurora_endpoint }}
+      alb_dns_name:       ${{ steps.tf_out.outputs.alb_dns_name }}
+      ecr_backend_url:    ${{ steps.tf_out.outputs.ecr_backend_url }}
+      ecr_worker_url:     ${{ steps.tf_out.outputs.ecr_worker_url }}
+      aws_account_id:     ${{ steps.tf_out.outputs.aws_account_id }}
+      vpc_id:             ${{ steps.tf_out.outputs.vpc_id }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure AWS Credentials
@@ -167,22 +169,18 @@ jobs:
         id: tf_out
         working-directory: ${{ env.TF_DIR }}
         run: |
-          echo "eks_cluster_name=$(terraform output -raw eks_cluster_name)"  >> $GITHUB_OUTPUT
-          echo "rabbitmq_ip=$(terraform output -raw rabbitmq_private_ip)"    >> $GITHUB_OUTPUT
-          echo "aurora_endpoint=$(terraform output -raw aurora_endpoint)"    >> $GITHUB_OUTPUT
-          echo "alb_dns_name=$(terraform output -raw alb_dns_name)"          >> $GITHUB_OUTPUT
-          echo "ecr_backend_url=$(terraform output -raw ecr_backend_url)"    >> $GITHUB_OUTPUT
-          echo "ecr_worker_url=$(terraform output -raw ecr_worker_url)"      >> $GITHUB_OUTPUT
-          # Extra outputs needed for AWS Load Balancer Controller
+          echo "eks_cluster_name=$(terraform output -raw eks_cluster_name)"    >> $GITHUB_OUTPUT
+          echo "rabbitmq_ip=$(terraform output -raw rabbitmq_private_ip)"      >> $GITHUB_OUTPUT
+          echo "rabbitmq_public_ip=$(terraform output -raw rabbitmq_public_ip)" >> $GITHUB_OUTPUT
+          echo "aurora_endpoint=$(terraform output -raw aurora_endpoint)"      >> $GITHUB_OUTPUT
+          echo "alb_dns_name=$(terraform output -raw alb_dns_name)"            >> $GITHUB_OUTPUT
+          echo "ecr_backend_url=$(terraform output -raw ecr_backend_url)"      >> $GITHUB_OUTPUT
+          echo "ecr_worker_url=$(terraform output -raw ecr_worker_url)"        >> $GITHUB_OUTPUT
           echo "aws_account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
           echo "vpc_id=$(terraform output -raw vpc_id 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 4 — Install cluster tools including AWS Load Balancer Controller
-  #
-  # THIS IS THE KEY FIX — AWS Load Balancer Controller is what connects
-  # Kubernetes Ingress resources to the actual AWS ALB.
-  # Without it, pods are NEVER registered as ALB targets.
+  # JOB 4 — Install cluster tools: AWS LB Controller + ArgoCD + KEDA + Prometheus
   # ═══════════════════════════════════════════════════════════════════════════
   install-cluster-tools:
     name: Install ArgoCD + AWS LB Controller + KEDA + Prometheus
@@ -215,55 +213,37 @@ jobs:
           done
       - name: Add Helm repos
         run: |
-          helm repo add argo                https://argoproj.github.io/argo-helm
-          helm repo add kedacore            https://kedacore.github.io/charts
+          helm repo add argo                  https://argoproj.github.io/argo-helm
+          helm repo add kedacore              https://kedacore.github.io/charts
           helm repo add prometheus-community  https://prometheus-community.github.io/helm-charts
-          helm repo add eks                 https://aws.github.io/eks-charts
+          helm repo add eks                   https://aws.github.io/eks-charts
           helm repo update
 
-      # ── STEP 1: Create IAM Service Account for AWS Load Balancer Controller ─
-      # The LB controller needs IAM permissions to create/manage ALBs on AWS.
-      # We attach an IAM policy directly to the EKS node role as a simple
-      # approach that works without IRSA (no OIDC required).
       - name: Create IAM policy for AWS Load Balancer Controller
         run: |
           POLICY_NAME="AWSLoadBalancerControllerIAMPolicy"
           ACCOUNT_ID="${{ needs.terraform-apply.outputs.aws_account_id }}"
-
-          # Download the official AWS LB Controller IAM policy
           curl -sSL -o /tmp/alb-iam-policy.json \
             https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.0/docs/install/iam_policy.json
-
-          # Create policy (idempotent — fails silently if already exists)
           aws iam create-policy \
             --policy-name "$POLICY_NAME" \
             --policy-document file:///tmp/alb-iam-policy.json \
             2>/dev/null || echo "Policy already exists"
-
-          # Attach to EKS node IAM role so controller pods can call AWS APIs
           NODE_ROLE=$(aws eks describe-nodegroup \
             --cluster-name ${{ needs.terraform-apply.outputs.eks_cluster_name }} \
             --nodegroup-name ecommerce-node-group \
             --query 'nodegroup.nodeRole' \
             --output text | awk -F'/' '{print $NF}')
-
           aws iam attach-role-policy \
             --role-name "$NODE_ROLE" \
             --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}" \
             2>/dev/null || echo "Policy already attached"
-
           echo "IAM policy attached to node role: $NODE_ROLE"
 
-      # ── STEP 2: Install AWS Load Balancer Controller via Helm ──────────────
-      # This controller watches for Kubernetes Ingress objects and
-      # automatically programs the AWS ALB to route traffic to pods.
-      # This is what makes "kubectl apply ingress.yaml" actually work on EKS.
       - name: Install AWS Load Balancer Controller
         run: |
-          # Create service account
           kubectl create serviceaccount aws-load-balancer-controller \
             -n kube-system --dry-run=client -o yaml | kubectl apply -f -
-
           helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
             --namespace kube-system \
             --set clusterName=${{ needs.terraform-apply.outputs.eks_cluster_name }} \
@@ -272,23 +252,11 @@ jobs:
             --set region=${{ env.AWS_REGION }} \
             --set vpcId=${{ needs.terraform-apply.outputs.vpc_id }} \
             --wait --timeout=300s
-
           echo "AWS Load Balancer Controller installed"
           kubectl get deployment aws-load-balancer-controller -n kube-system
 
-      # ── STEP 3: Apply the Kubernetes Ingress resource ─────────────────────
-      # This Ingress tells the AWS LB Controller:
-      #   /        → frontend service (port 80)
-      #   /api/*   → backend service  (port 3000)
-      #   /health  → backend service  (port 3000)
-      # The controller reads this and programs the ALB target groups.
       - name: Apply ALB Ingress resource
         run: |
-          # Get the existing ALB ARN created by Terraform
-          ALB_ARN=$(aws elbv2 describe-load-balancers \
-            --query "LoadBalancers[?LoadBalancerName=='ecommerce-alb'].LoadBalancerArn" \
-            --output text 2>/dev/null || echo "")
-
           cat <<EOF | kubectl apply -f -
           apiVersion: networking.k8s.io/v1
           kind: Ingress
@@ -296,7 +264,6 @@ jobs:
             name: ecommerce-ingress
             namespace: default
             annotations:
-              # Use the existing ALB created by Terraform (not a new one)
               kubernetes.io/ingress.class: alb
               alb.ingress.kubernetes.io/scheme: internet-facing
               alb.ingress.kubernetes.io/target-type: ip
@@ -306,13 +273,10 @@ jobs:
               alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
               alb.ingress.kubernetes.io/healthy-threshold-count: "2"
               alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
-              # WAF association (WAF already attached to ALB by Terraform)
-              alb.ingress.kubernetes.io/wafv2-acl-arn: ""
           spec:
             rules:
               - http:
                   paths:
-                    # API routes → backend (port 3000)
                     - path: /api
                       pathType: Prefix
                       backend:
@@ -327,7 +291,6 @@ jobs:
                           name: backend
                           port:
                             number: 3000
-                    # All other routes → frontend (port 80)
                     - path: /
                       pathType: Prefix
                       backend:
@@ -336,9 +299,8 @@ jobs:
                           port:
                             number: 80
           EOF
-          echo "Ingress applied — AWS LB Controller will now register pods as ALB targets"
+          echo "Ingress applied"
 
-      # ── STEP 4: Install ArgoCD with LoadBalancer ───────────────────────────
       - name: Install ArgoCD (LoadBalancer)
         run: |
           helm upgrade --install argocd argo/argo-cd \
@@ -379,7 +341,6 @@ jobs:
             -o jsonpath="{.data.password}" | base64 -d)
           echo "password=$PASS" >> $GITHUB_OUTPUT
 
-      # ── STEP 5: Install Argo Workflows ────────────────────────────────────
       - name: Install Argo Workflows (LoadBalancer)
         run: |
           helm upgrade --install argo-workflows argo/argo-workflows \
@@ -391,13 +352,11 @@ jobs:
             --set "server.serviceAnnotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme"=internet-facing \
             --wait --timeout=300s
 
-      # ── STEP 6: Install KEDA ──────────────────────────────────────────────
       - name: Install KEDA
         run: |
           helm upgrade --install keda kedacore/keda \
             --namespace keda --wait --timeout=300s
 
-      # ── STEP 7: Install Prometheus + Grafana ──────────────────────────────
       - name: Install kube-prometheus-stack (Grafana on LoadBalancer)
         run: |
           helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
@@ -574,7 +533,7 @@ jobs:
           kubectl get cronworkflow -n argo
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 7 — Verify: ArgoCD sync + ALB targets registered + app health check
+  # JOB 7 — Verify: ArgoCD sync + ALB targets + app health + print ALL URLs
   # ═══════════════════════════════════════════════════════════════════════════
   verify-deployment:
     name: Verify ArgoCD Sync + ALB Targets + App Health
@@ -623,21 +582,16 @@ jobs:
             --sync --health --timeout 300
           echo "ecommerce-worker: Synced + Healthy"
 
-      # ── Verify ALB target groups have healthy targets ─────────────────────
-      # This confirms pods are actually registered and healthy in the ALB.
-      # If targets are empty here, the Ingress or LB Controller has an issue.
       - name: Verify ALB target groups have registered targets
         run: |
           echo "=== Checking ALB target group health ==="
           ALB_ARN=$(aws elbv2 describe-load-balancers \
             --query "LoadBalancers[?LoadBalancerName=='ecommerce-alb'].LoadBalancerArn" \
             --output text)
-
           TG_ARNS=$(aws elbv2 describe-target-groups \
             --load-balancer-arn "$ALB_ARN" \
             --query "TargetGroups[*].TargetGroupArn" \
             --output text)
-
           for TG_ARN in $TG_ARNS; do
             TG_NAME=$(aws elbv2 describe-target-groups \
               --target-group-arns "$TG_ARN" \
@@ -663,7 +617,6 @@ jobs:
           echo "=== KEDA ScaledObject ===" && kubectl get scaledobject -n worker
           echo "=== Argo CronWorkflow ===" && kubectl get cronworkflow -n argo
 
-      # ── App health check via ALB ───────────────────────────────────────────
       - name: Health check — ecommerce app via ALB
         run: |
           ALB="${{ needs.terraform-apply.outputs.alb_dns_name }}"
@@ -680,7 +633,6 @@ jobs:
           done
           [ "$STATUS" != "200" ] && kubectl describe ingress ecommerce-ingress -n default && exit 1
 
-      # ── Read Grafana credentials directly from K8s secret ─────────────────
       - name: Get Grafana credentials from K8s secret
         run: |
           GRAFANA_USER=$(kubectl get secret prometheus-grafana -n monitoring \
@@ -693,6 +645,7 @@ jobs:
           echo "Grafana User : $GRAFANA_USER"
           echo "Grafana Pass : $GRAFANA_PASS"
 
+      # ── FINAL STEP: Print ALL access URLs including RabbitMQ public IP ─────
       - name: Print all access URLs
         run: |
           ARGO_WF=$(kubectl get svc argo-workflows-server -n argo \
@@ -704,6 +657,7 @@ jobs:
           echo "================================================================"
           echo " FULL DEPLOYMENT COMPLETE"
           echo "================================================================"
+          echo ""
           echo " Ecommerce App (AWS ALB + WAF)"
           echo "   http://${{ needs.terraform-apply.outputs.alb_dns_name }}"
           echo ""
@@ -719,6 +673,12 @@ jobs:
           echo "   URL      : http://$GRAFANA"
           echo "   Username : admin"
           echo "   Password : $GRAFANA_PASS"
+          echo ""
+          echo " RabbitMQ Management UI (EC2 public IP)"
+          echo "   http://${{ needs.terraform-apply.outputs.rabbitmq_public_ip }}:15672"
+          echo "   Username : admin"
+          echo "   Password : (value of RABBITMQ_PASSWORD GitHub secret)"
+          echo ""
           echo "================================================================"
           echo " GitOps active: push to main -> ArgoCD auto-deploys to EKS"
           echo " Repo: https://github.com/parthorookie/ecommercethreetierevent1edited"
