@@ -1,0 +1,67 @@
+replicaCount: 2
+
+backend:
+  image:
+    repository: ""   # set by CI: <account>.dkr.ecr.ap-south-1.amazonaws.com/ecommerce-backend
+    tag: "latest"
+    pullPolicy: Always
+  port: 3000
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  env:
+    NODE_ENV: production
+    PORT: "3000"
+
+frontend:
+  image:
+    repository: ""   # set by CI
+    tag: "latest"
+    pullPolicy: Always
+  port: 80
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+
+service:
+  backend:
+    type: ClusterIP
+    port: 3000
+  frontend:
+    type: ClusterIP
+    port: 80
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+  hosts:
+    - host: ""
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: backend
+        - path: /
+          pathType: Prefix
+          service: frontend
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+secrets:
+  name: app-secrets
